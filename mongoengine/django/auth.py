@@ -43,7 +43,8 @@ class User(Document):
     meta = {
         'indexes': [
             {'fields': ['username'], 'unique': True}
-        ]
+        ],
+        'allow_inheritance': True,
     }
 
     def __unicode__(self):
