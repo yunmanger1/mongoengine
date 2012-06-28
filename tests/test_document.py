@@ -1,3 +1,4 @@
+import os
 import pickle
 import pymongo
 import bson
@@ -6,12 +7,14 @@ import warnings
 
 from datetime import datetime
 
-from fixtures import Base, Mixin, PickleEmbedded, PickleTest
+from tests.fixtures import Base, Mixin, PickleEmbedded, PickleTest
 
 from mongoengine import *
 from mongoengine.base import NotRegistered, InvalidDocumentError
 from mongoengine.queryset import InvalidQueryError
 from mongoengine.connection import get_db
+
+TEST_IMAGE_PATH = os.path.join(os.path.dirname(__file__), 'mongoengine.png')
 
 
 class DocumentTest(unittest.TestCase):
@@ -661,6 +664,26 @@ class DocumentTest(unittest.TestCase):
 
         BlogPost.drop_collection()
 
+    def test_db_field_load(self):
+        """Ensure we load data correctly
+        """
+        class Person(Document):
+            name = StringField(required=True)
+            _rank = StringField(required=False, db_field="rank")
+
+            @property
+            def rank(self):
+                return self._rank or "Private"
+
+        Person.drop_collection()
+
+        Person(name="Jack", _rank="Corporal").save()
+
+        Person(name="Fred").save()
+
+        self.assertEquals(Person.objects.get(name="Jack").rank, "Corporal")
+        self.assertEquals(Person.objects.get(name="Fred").rank, "Private")
+
     def test_explicit_geo2d_index(self):
         """Ensure that geo2d indexes work when created via meta[indexes]
         """
@@ -740,6 +763,28 @@ class DocumentTest(unittest.TestCase):
         info = Person.objects._collection.index_information()
         self.assertEqual(info.keys(), ['_types_1_user_guid_1', '_id_', '_types_1_name_1'])
         Person.drop_collection()
+
+    def test_disable_index_creation(self):
+        """Tests setting auto_create_index to False on the connection will
+        disable any index generation.
+        """
+        class User(Document):
+            meta = {
+                'indexes': ['user_guid'],
+                'auto_create_index': False
+            }
+            user_guid = StringField(required=True)
+
+
+        User.drop_collection()
+
+        u = User(user_guid='123')
+        u.save()
+
+        self.assertEquals(1, User.objects.count())
+        info = User.objects._collection.index_information()
+        self.assertEqual(info.keys(), ['_id_'])
+        User.drop_collection()
 
     def test_embedded_document_index(self):
         """Tests settings an index on an embedded document
@@ -841,6 +886,26 @@ class DocumentTest(unittest.TestCase):
 
         query_plan = Test.objects(a=1).only('a').exclude('id').explain()
         self.assertTrue(query_plan['indexOnly'])
+
+    def test_index_on_id(self):
+
+        class BlogPost(Document):
+            meta = {
+                'indexes': [
+                    ['categories', 'id']
+                ],
+                'allow_inheritance': False
+            }
+
+            title = StringField(required=True)
+            description = StringField(required=True)
+            categories = ListField()
+
+        BlogPost.drop_collection()
+
+        indexes = BlogPost.objects._collection.index_information()
+        self.assertEquals(indexes['categories_1__id_1']['key'],
+                                 [('categories', 1), ('_id', 1)])
 
     def test_hint(self):
 
@@ -1217,6 +1282,22 @@ class DocumentTest(unittest.TestCase):
         comment.date = datetime.now()
         comment.validate()
 
+    def test_embedded_db_field_validate(self):
+
+        class SubDoc(EmbeddedDocument):
+            val = IntField()
+
+        class Doc(Document):
+            e = EmbeddedDocumentField(SubDoc, db_field='eb')
+
+        Doc.drop_collection()
+
+        Doc(e=SubDoc(val=15)).save()
+
+        doc = Doc.objects.first()
+        doc.validate()
+        self.assertEquals([None, 'e'], doc._data.keys())
+
     def test_save(self):
         """Ensure that a document may be saved in the database.
         """
@@ -1285,6 +1366,30 @@ class DocumentTest(unittest.TestCase):
         p0 = Person.objects.first()
         p0.name = 'wpjunior'
         p0.save()
+
+    def test_save_max_recursion_not_hit_with_file_field(self):
+
+        class Foo(Document):
+            name = StringField()
+            picture = FileField()
+            bar = ReferenceField('self')
+
+        Foo.drop_collection()
+
+        a = Foo(name='hello')
+        a.save()
+
+        a.bar = a
+        a.picture = open(TEST_IMAGE_PATH, 'rb')
+        a.save()
+
+        # Confirm can save and it resets the changed fields without hitting
+        # max recursion error
+        b = Foo.objects.with_id(a.id)
+        b.name='world'
+        b.save()
+
+        self.assertEquals(b.picture, b.bar.picture, b.bar.bar.picture)
 
     def test_save_cascades(self):
 
@@ -1548,6 +1653,77 @@ class DocumentTest(unittest.TestCase):
 
         site = Site.objects.first()
         self.assertEqual(site.page.log_message, "Error: Dummy message")
+
+    def test_circular_reference_deltas(self):
+
+        class Person(Document):
+            name = StringField()
+            owns = ListField(ReferenceField('Organization'))
+
+        class Organization(Document):
+            name = StringField()
+            owner = ReferenceField('Person')
+
+        Person.drop_collection()
+        Organization.drop_collection()
+
+        person = Person(name="owner")
+        person.save()
+        organization = Organization(name="company")
+        organization.save()
+
+        person.owns.append(organization)
+        organization.owner = person
+
+        person.save()
+        organization.save()
+
+        p = Person.objects[0].select_related()
+        o = Organization.objects.first()
+        self.assertEquals(p.owns[0], o)
+        self.assertEquals(o.owner, p)
+
+    def test_circular_reference_deltas_2(self):
+
+        class Person( Document ):
+           name = StringField()
+           owns = ListField( ReferenceField( 'Organization' ) )
+           employer = ReferenceField( 'Organization' )
+
+        class Organization( Document ):
+           name = StringField()
+           owner = ReferenceField( 'Person' )
+           employees = ListField( ReferenceField( 'Person' ) )
+
+        Person.drop_collection()
+        Organization.drop_collection()
+
+        person = Person( name="owner" )
+        person.save()
+
+        employee = Person( name="employee" )
+        employee.save()
+
+        organization = Organization( name="company" )
+        organization.save()
+
+        person.owns.append( organization )
+        organization.owner = person
+
+        organization.employees.append( employee )
+        employee.employer = organization
+
+        person.save()
+        organization.save()
+        employee.save()
+
+        p = Person.objects.get(name="owner")
+        e = Person.objects.get(name="employee")
+        o = Organization.objects.first()
+
+        self.assertEquals(p.owns[0], o)
+        self.assertEquals(o.owner, p)
+        self.assertEquals(e.employer, o)
 
     def test_delta(self):
 
@@ -2376,6 +2552,22 @@ class DocumentTest(unittest.TestCase):
 
         self.assertRaises(InvalidDocumentError, throw_invalid_document_error)
 
+    def test_invalid_son(self):
+        """Raise an error if loading invalid data"""
+        class Occurrence(EmbeddedDocument):
+            number = IntField()
+
+        class Word(Document):
+            stem = StringField()
+            count = IntField(default=1)
+            forms = ListField(StringField(), default=list)
+            occurs = ListField(EmbeddedDocumentField(Occurrence), default=list)
+
+        def raise_invalid_document():
+            Word._from_son({'stem': [1,2,3], 'forms': 1, 'count': 'one', 'occurs': {"hello": None}})
+
+        self.assertRaises(InvalidDocumentError, raise_invalid_document)
+
     def test_reverse_delete_rule_cascade_and_nullify(self):
         """Ensure that a referenced document is also deleted upon deletion.
         """
@@ -2437,6 +2629,40 @@ class DocumentTest(unittest.TestCase):
         # Delete the Person, which should lead to deletion of the BlogPost, too
         author.delete()
         self.assertEqual(len(BlogPost.objects), 0)
+
+    def test_two_way_reverse_delete_rule(self):
+        """Ensure that Bi-Directional relationships work with
+        reverse_delete_rule
+        """
+
+        class Bar(Document):
+            content = StringField()
+            foo = ReferenceField('Foo')
+
+        class Foo(Document):
+            content = StringField()
+            bar = ReferenceField(Bar)
+
+        Bar.register_delete_rule(Foo, 'bar', NULLIFY)
+        Foo.register_delete_rule(Bar, 'foo', NULLIFY)
+
+
+        Bar.drop_collection()
+        Foo.drop_collection()
+
+        b = Bar(content="Hello")
+        b.save()
+
+        f = Foo(content="world", bar=b)
+        f.save()
+
+        b.foo = f
+        b.save()
+
+        f.delete()
+
+        self.assertEqual(len(Bar.objects), 1)  # No effect on the BlogPost
+        self.assertEqual(Bar.objects.get().foo, None)
 
     def test_invalid_reverse_delete_rules_raise_errors(self):
 
@@ -2838,6 +3064,79 @@ class DocumentTest(unittest.TestCase):
                                                        this.name == '2';}"""
                                         }
                                     ) ]), "1,2")
+
+
+class ValidatorErrorTest(unittest.TestCase):
+
+    def test_to_dict(self):
+        """Ensure a ValidationError handles error to_dict correctly.
+        """
+        error = ValidationError('root')
+        self.assertEquals(error.to_dict(), {})
+
+        # 1st level error schema
+        error.errors = {'1st': ValidationError('bad 1st'), }
+        self.assertTrue('1st' in error.to_dict())
+        self.assertEquals(error.to_dict()['1st'], 'bad 1st')
+
+        # 2nd level error schema
+        error.errors = {'1st': ValidationError('bad 1st', errors={
+            '2nd': ValidationError('bad 2nd'),
+        })}
+        self.assertTrue('1st' in error.to_dict())
+        self.assertTrue(isinstance(error.to_dict()['1st'], dict))
+        self.assertTrue('2nd' in error.to_dict()['1st'])
+        self.assertEquals(error.to_dict()['1st']['2nd'], 'bad 2nd')
+
+        # moar levels
+        error.errors = {'1st': ValidationError('bad 1st', errors={
+            '2nd': ValidationError('bad 2nd', errors={
+                '3rd': ValidationError('bad 3rd', errors={
+                    '4th': ValidationError('Inception'),
+                }),
+            }),
+        })}
+        self.assertTrue('1st' in error.to_dict())
+        self.assertTrue('2nd' in error.to_dict()['1st'])
+        self.assertTrue('3rd' in error.to_dict()['1st']['2nd'])
+        self.assertTrue('4th' in error.to_dict()['1st']['2nd']['3rd'])
+        self.assertEquals(error.to_dict()['1st']['2nd']['3rd']['4th'],
+                         'Inception')
+
+        self.assertEquals(error.message, "root:\n1st.2nd.3rd.4th: Inception")
+
+    def test_model_validation(self):
+
+        class User(Document):
+            username = StringField(primary_key=True)
+            name = StringField(required=True)
+
+        try:
+            User().validate()
+        except ValidationError, e:
+            expected_error_message = """Errors encountered validating document:
+username: Field is required ("username")
+name: Field is required ("name")"""
+            self.assertEquals(e.message, expected_error_message)
+            self.assertEquals(e.to_dict(), {
+                'username': 'Field is required ("username")',
+                'name': u'Field is required ("name")'})
+
+    def test_spaces_in_keys(self):
+
+        class Embedded(DynamicEmbeddedDocument):
+            pass
+
+        class Doc(DynamicDocument):
+            pass
+
+        Doc.drop_collection()
+        doc = Doc()
+        setattr(doc, 'hello world', 1)
+        doc.save()
+
+        one = Doc.objects.filter(**{'hello world': 1}).count()
+        self.assertEqual(1, one)
 
 if __name__ == '__main__':
     unittest.main()

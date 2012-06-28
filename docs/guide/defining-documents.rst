@@ -98,7 +98,7 @@ arguments can be set on all fields:
 
 :attr:`required` (Default: False)
     If set to True and the field is not set on the document instance, a
-    :class:`~mongoengine.base.ValidationError` will be raised when the document is
+    :class:`~mongoengine.ValidationError` will be raised when the document is
     validated.
 
 :attr:`default` (Default: None)
@@ -289,6 +289,10 @@ Its value can take any of the following constants:
 :const:`mongoengine.CASCADE`
   Any object containing fields that are refererring to the object being deleted
   are deleted first.
+:const:`mongoengine.PULL`
+  Removes the reference to the object (using MongoDB's "pull" operation)
+  from any object's fields of
+  :class:`~mongoengine.ListField` (:class:`~mongoengine.ReferenceField`).
 
 
 .. warning::

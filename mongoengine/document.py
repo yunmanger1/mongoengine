@@ -1,4 +1,5 @@
 import pymongo
+
 from bson.dbref import DBRef
 
 from mongoengine import signals
@@ -39,6 +40,11 @@ class EmbeddedDocument(BaseDocument):
         else:
             super(EmbeddedDocument, self).__delattr__(*args, **kwargs)
 
+    def __eq__(self, other):
+        if isinstance(other, self.__class__):
+            return self._data == other._data
+        return False
+
 
 class Document(BaseDocument):
     """The base class used for defining the structure and properties of
@@ -74,8 +80,14 @@ class Document(BaseDocument):
     names. Index direction may be specified by prefixing the field names with
     a **+** or **-** sign.
 
+    Automatic index creation can be disabled by specifying
+    attr:`auto_create_index` in the :attr:`meta` dictionary. If this is set to
+    False then indexes will not be created by MongoEngine.  This is useful in
+    production systems where index creation is performed as part of a deployment
+    system.
+
     By default, _types will be added to the start of every index (that
-    doesn't contain a list) if allow_inheritence is True. This can be
+    doesn't contain a list) if allow_inheritance is True. This can be
     disabled by either setting types to False on the specific index or
     by setting index_types to False on the meta dictionary for the document.
     """
@@ -147,8 +159,9 @@ class Document(BaseDocument):
                 :meth:`~pymongo.collection.Collection.save` OR
                 :meth:`~pymongo.collection.Collection.insert`
                 which will be used as options for the resultant ``getLastError`` command.
-                For example, ``save(..., w=2, fsync=True)`` will wait until at least two servers
-                have recorded the write and will force an fsync on each server being written to.
+                For example, ``save(..., write_options={w: 2, fsync: True}, ...)`` will
+                wait until at least two servers have recorded the write and will force an
+                fsync on each server being written to.
         :param cascade: Sets the flag for cascading saves.  You can set a default by setting
             "cascade" in the document __meta__
         :param cascade_kwargs: optional kwargs dictionary to be passed throw to cascading saves
@@ -213,6 +226,7 @@ class Document(BaseDocument):
                 if cascade_kwargs:  # Allow granular control over cascades
                     kwargs.update(cascade_kwargs)
                 kwargs['_refs'] = _refs
+                #self._changed_fields = []
                 self.cascade_save(**kwargs)
 
         except pymongo.errors.OperationFailure, err:
@@ -226,11 +240,13 @@ class Document(BaseDocument):
         self._changed_fields = []
         self._created = False
         signals.post_save.send(self.__class__, document=self, created=created)
+        return self
 
     def cascade_save(self, *args, **kwargs):
         """Recursively saves any references / generic references on an object"""
         from fields import ReferenceField, GenericReferenceField
         _refs = kwargs.get('_refs', []) or []
+
         for name, cls in self._fields.items():
             if not isinstance(cls, (ReferenceField, GenericReferenceField)):
                 continue
@@ -351,7 +367,7 @@ class DynamicDocument(Document):
     way as an ordinary document but has expando style properties.  Any data
     passed or set against the :class:`~mongoengine.DynamicDocument` that is
     not a field is automatically converted into a
-    :class:`~mongoengine.BaseDynamicField` and data can be attributed to that
+    :class:`~mongoengine.DynamicField` and data can be attributed to that
     field.
 
     ..note::

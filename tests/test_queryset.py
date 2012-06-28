@@ -480,7 +480,7 @@ class QuerySetTest(unittest.TestCase):
         self.assertEqual(person.name, "User C")
 
     def test_bulk_insert(self):
-        """Ensure that query by array position works.
+        """Ensure that bulk insert works
         """
 
         class Comment(EmbeddedDocument):
@@ -490,7 +490,7 @@ class QuerySetTest(unittest.TestCase):
             comments = ListField(EmbeddedDocumentField(Comment))
 
         class Blog(Document):
-            title = StringField()
+            title = StringField(unique=True)
             tags = ListField(StringField())
             posts = ListField(EmbeddedDocumentField(Post))
 
@@ -563,6 +563,23 @@ class QuerySetTest(unittest.TestCase):
         obj_id = Blog.objects.insert(blog1, load_bulk=False)
         self.assertEquals(obj_id.__class__.__name__, 'ObjectId')
 
+        Blog.drop_collection()
+        post3 = Post(comments=[comment1, comment1])
+        blog1 = Blog(title="foo", posts=[post1, post2])
+        blog2 = Blog(title="bar", posts=[post2, post3])
+        blog3 = Blog(title="baz", posts=[post1, post2])
+        Blog.objects.insert([blog1, blog2])
+
+        def throw_operation_error_not_unique():
+            Blog.objects.insert([blog2, blog3], safe=True)
+
+        self.assertRaises(OperationError, throw_operation_error_not_unique)
+        self.assertEqual(Blog.objects.count(), 2)
+
+        Blog.objects.insert([blog2, blog3], write_options={'continue_on_error': True})
+        self.assertEqual(Blog.objects.count(), 3)
+
+
     def test_slave_okay(self):
         """Ensures that a query can take slave_okay syntax
         """
@@ -619,17 +636,38 @@ class QuerySetTest(unittest.TestCase):
         self.assertEqual(people1, people2)
         self.assertEqual(people1, people3)
 
-    def test_repr_iteration(self):
-        """Ensure that QuerySet __repr__ can handle loops
-        """
-        self.Person(name='Person 1').save()
-        self.Person(name='Person 2').save()
+    def test_repr(self):
+        """Test repr behavior isnt destructive"""
 
-        queryset = self.Person.objects
-        self.assertEquals('[<Person: Person object>, <Person: Person object>]', repr(queryset))
-        for person in queryset:
-            self.assertEquals('.. queryset mid-iteration ..', repr(queryset))
+        class Doc(Document):
+            number = IntField()
 
+            def __repr__(self):
+               return "<Doc: %s>" % self.number
+
+        Doc.drop_collection()
+
+        for i in xrange(1000):
+            Doc(number=i).save()
+
+        docs = Doc.objects.order_by('number')
+
+        self.assertEquals(docs.count(), 1000)
+        self.assertEquals(len(docs), 1000)
+
+        docs_string = "%s" % docs
+        self.assertTrue("Doc: 0" in docs_string)
+
+        self.assertEquals(docs.count(), 1000)
+        self.assertEquals(len(docs), 1000)
+
+        # Limit and skip
+        self.assertEquals('[<Doc: 1>, <Doc: 2>, <Doc: 3>]', "%s" % docs[1:4])
+
+        self.assertEquals(docs.count(), 3)
+        self.assertEquals(len(docs), 3)
+        for doc in docs:
+            self.assertEqual('.. queryset mid-iteration ..', repr(docs))
 
     def test_regex_query_shortcuts(self):
         """Ensure that contains, startswith, endswith, etc work.
@@ -1327,6 +1365,37 @@ class QuerySetTest(unittest.TestCase):
         self.Person.objects(name='Test User').delete()
         self.assertEqual(1, BlogPost.objects.count())
 
+    def test_reverse_delete_rule_cascade_self_referencing(self):
+        """Ensure self-referencing CASCADE deletes do not result in infinite loop
+        """
+        class Category(Document):
+            name = StringField()
+            parent = ReferenceField('self', reverse_delete_rule=CASCADE)
+
+        num_children = 3
+        base = Category(name='Root')
+        base.save()
+
+        # Create a simple parent-child tree
+        for i in range(num_children):
+            child_name = 'Child-%i' % i
+            child = Category(name=child_name, parent=base)
+            child.save()
+
+            for i in range(num_children):
+                child_child_name = 'Child-Child-%i' % i
+                child_child = Category(name=child_child_name, parent=child)
+                child_child.save()
+
+        tree_size = 1 + num_children + (num_children * num_children)
+        self.assertEquals(tree_size, Category.objects.count())
+        self.assertEquals(num_children, Category.objects(parent=base).count())
+
+        # The delete should effectively wipe out the Category collection
+        # without resulting in infinite parent-child cascade recursion
+        base.delete()
+        self.assertEquals(0, Category.objects.count())
+
     def test_reverse_delete_rule_nullify(self):
         """Ensure nullification of references to deleted documents.
         """
@@ -1370,6 +1439,36 @@ class QuerySetTest(unittest.TestCase):
         post.save()
 
         self.assertRaises(OperationError, self.Person.objects.delete)
+
+    def test_reverse_delete_rule_pull(self):
+        """Ensure pulling of references to deleted documents.
+        """
+        class BlogPost(Document):
+            content = StringField()
+            authors = ListField(ReferenceField(self.Person,
+                reverse_delete_rule=PULL))
+
+        BlogPost.drop_collection()
+        self.Person.drop_collection()
+
+        me = self.Person(name='Test User')
+        me.save()
+
+        someoneelse = self.Person(name='Some-one Else')
+        someoneelse.save()
+
+        post = BlogPost(content='Watching TV', authors=[me, someoneelse])
+        post.save()
+
+        another = BlogPost(content='Chilling Out', authors=[someoneelse])
+        another.save()
+
+        someoneelse.delete()
+        post.reload()
+        another.reload()
+
+        self.assertEqual(post.authors, [me])
+        self.assertEqual(another.authors, [])
 
     def test_update(self):
         """Ensure that atomic updates work properly.
@@ -1454,6 +1553,35 @@ class QuerySetTest(unittest.TestCase):
         post.reload()
         self.assertEqual(post.tags, ["code", "mongodb"])
 
+    def test_pull_nested(self):
+
+        class User(Document):
+            name = StringField()
+
+        class Collaborator(EmbeddedDocument):
+            user = StringField()
+
+            def __unicode__(self):
+                return '%s' % self.user
+
+        class Site(Document):
+            name = StringField(max_length=75, unique=True, required=True)
+            collaborators = ListField(EmbeddedDocumentField(Collaborator))
+
+
+        Site.drop_collection()
+
+        c = Collaborator(user='Esteban')
+        s = Site(name="test", collaborators=[c])
+        s.save()
+
+        Site.objects(id=s.id).update_one(pull__collaborators__user='Esteban')
+        self.assertEqual(Site.objects.first().collaborators, [])
+
+        def pull_all():
+            Site.objects(id=s.id).update_one(pull_all__collaborators__user=['Ross'])
+
+        self.assertRaises(InvalidQueryError, pull_all)
 
     def test_update_one_pop_generic_reference(self):
 
@@ -2898,6 +3026,19 @@ class QuerySetTest(unittest.TestCase):
         self.assertEqual(plist[0], (10, True))
         self.assertEqual(plist[1], (20, False))
         self.assertEqual(plist[2], (30, True))
+
+    def test_scalar_primary_key(self):
+
+        class SettingValue(Document):
+            key = StringField(primary_key=True)
+            value = StringField()
+
+        SettingValue.drop_collection()
+        s = SettingValue(key="test", value="test value")
+        s.save()
+
+        val = SettingValue.objects.scalar('key', 'value')
+        self.assertEqual(list(val), [('test', 'test value')])
 
     def test_scalar_cursor_behaviour(self):
         """Ensure that a query returns a valid set of results.

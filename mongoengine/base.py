@@ -25,7 +25,15 @@ class InvalidDocumentError(Exception):
 
 class ValidationError(AssertionError):
     """Validation exception.
+
+    May represent an error validating a field or a
+    document containing fields with validation errors.
+
+    :ivar errors: A dictionary of errors for fields within this
+        document or list, or None if the error is for an
+        individual field.
     """
+
     errors = {}
     field_name = None
     _message = None
@@ -43,10 +51,12 @@ class ValidationError(AssertionError):
 
     def __getattribute__(self, name):
         message = super(ValidationError, self).__getattribute__(name)
-        if name == 'message' and self.field_name:
-            return message + ' ("%s")' % self.field_name
-        else:
-            return message
+        if name == 'message':
+            if self.field_name:
+                message = '%s ("%s")' % (message, self.field_name)
+            if self.errors:
+                message = '%s:\n%s' % (message, self._format_errors())
+        return message
 
     def _get_message(self):
         return self._message
@@ -57,6 +67,13 @@ class ValidationError(AssertionError):
     message = property(_get_message, _set_message)
 
     def to_dict(self):
+        """Returns a dictionary of all errors within a document
+
+        Keys are field names or list indices and values are the
+        validation error messages, or a nested dictionary of
+        errors for an embedded document or list.
+        """
+
         def build_dict(source):
             errors_dict = {}
             if not source:
@@ -72,6 +89,21 @@ class ValidationError(AssertionError):
         if not self.errors:
             return {}
         return build_dict(self.errors)
+
+    def _format_errors(self):
+        """Returns a string listing all errors within a document"""
+
+        def format_error(field, value, prefix=''):
+            prefix = "%s.%s" % (prefix, field) if prefix else "%s" % field
+            if isinstance(value, dict):
+
+                return '\n'.join(
+                        [format_error(k, value[k], prefix) for k in value])
+            else:
+                return "%s: %s" % (prefix, value)
+
+        return '\n'.join(
+                [format_error(k, v) for k, v in self.to_dict().items()])
 
 
 _document_registry = {}
@@ -191,16 +223,18 @@ class BaseField(object):
         pass
 
     def _validate(self, value):
-
+        from mongoengine import Document, EmbeddedDocument
         # check choices
         if self.choices:
+            is_cls = isinstance(value, (Document, EmbeddedDocument))
+            value_to_check = value.__class__ if is_cls else value
+            err_msg = 'an instance' if is_cls else 'one'
             if isinstance(self.choices[0], (list, tuple)):
                 option_keys = [option_key for option_key, option_value in self.choices]
-                if value not in option_keys:
-                    self.error('Value must be one of %s' % unicode(option_keys))
-            else:
-                if value not in self.choices:
-                    self.error('Value must be one of %s' % unicode(self.choices))
+                if value_to_check not in option_keys:
+                    self.error('Value must be %s of %s' % (err_msg, unicode(option_keys)))
+            elif value_to_check not in self.choices:
+                self.error('Value must be %s of %s' % (err_msg, unicode(self.choices)))
 
         # check validation argument
         if self.validation is not None:
@@ -368,7 +402,7 @@ class ComplexBaseField(BaseField):
                 sequence = enumerate(value)
             for k, v in sequence:
                 try:
-                    self.field.validate(v)
+                    self.field._validate(v)
                 except (ValidationError, AssertionError), error:
                     if hasattr(error, 'errors'):
                         errors[k] = error.errors
@@ -399,47 +433,6 @@ class ComplexBaseField(BaseField):
         self._owner_document = owner_document
 
     owner_document = property(_get_owner_document, _set_owner_document)
-
-
-class BaseDynamicField(BaseField):
-    """Used by :class:`~mongoengine.DynamicDocument` to handle dynamic data"""
-
-    def to_mongo(self, value):
-        """Convert a Python type to a MongoDBcompatible type.
-        """
-
-        if isinstance(value, basestring):
-            return value
-
-        if hasattr(value, 'to_mongo'):
-            return value.to_mongo()
-
-        if not isinstance(value, (dict, list, tuple)):
-            return value
-
-        is_list = False
-        if not hasattr(value, 'items'):
-            is_list = True
-            value = dict([(k, v) for k, v in enumerate(value)])
-
-        data = {}
-        for k, v in value.items():
-            data[k] = self.to_mongo(v)
-
-        if is_list:  # Convert back to a list
-            value = [v for k, v in sorted(data.items(), key=operator.itemgetter(0))]
-        else:
-            value = data
-        return value
-
-    def lookup_member(self, member_name):
-        return member_name
-
-    def prepare_query_value(self, op, value):
-        if isinstance(value, basestring):
-            from mongoengine.fields import StringField
-            return StringField().prepare_query_value(op, value)
-        return self.to_mongo(value)
 
 
 class ObjectIdField(BaseField):
@@ -805,6 +798,7 @@ class BaseDocument(object):
                     dynamic_data[key] = value
         else:
             for key, value in values.items():
+                key = self._reverse_db_field_map.get(key, key)
                 setattr(self, key, value)
 
         # Set any get_fieldname_display methods
@@ -825,7 +819,8 @@ class BaseDocument(object):
 
             field = None
             if not hasattr(self, name) and not name.startswith('_'):
-                field = BaseDynamicField(db_field=name)
+                from fields import DynamicField
+                field = DynamicField(db_field=name)
                 field.name = name
                 self._dynamic_fields[name] = field
 
@@ -837,13 +832,6 @@ class BaseDocument(object):
                 self._data[name] = value
                 if hasattr(self, '_changed_fields'):
                     self._mark_as_changed(name)
-
-        # Handle None values for required fields
-        if value is None and name in getattr(self, '_fields', {}):
-            self._data[name] = value
-            if hasattr(self, '_changed_fields'):
-                self._mark_as_changed(name)
-            return
 
         if not self._created and name in self._meta.get('shard_key', tuple()):
             from queryset import OperationError
@@ -947,8 +935,8 @@ class BaseDocument(object):
         """
         # get the class name from the document, falling back to the given
         # class if unavailable
-        class_name = son.get(u'_cls', cls._class_name)
-        data = dict((str(key), value) for key, value in son.items())
+        class_name = son.get('_cls', cls._class_name)
+        data = dict(("%s" % key, value) for key, value in son.items())
 
         if '_types' in data:
             del data['_types']
@@ -961,11 +949,18 @@ class BaseDocument(object):
             cls = get_document(class_name)
 
         changed_fields = []
+        errors_dict = {}
+
         for field_name, field in cls._fields.items():
             if field.db_field in data:
                 value = data[field.db_field]
-                data[field_name] = (value if value is None
+                try:
+                    data[field_name] = (value if value is None
                                     else field.to_python(value))
+                    if field_name != field.db_field:
+                        del data[field.db_field]
+                except (AttributeError, ValueError), e:
+                    errors_dict[field_name] = e
             elif field.default:
                 default = field.default
                 if callable(default):
@@ -973,7 +968,13 @@ class BaseDocument(object):
                 if isinstance(default, BaseDocument):
                     changed_fields.append(field_name)
 
+        if errors_dict:
+            errors = "\n".join(["%s - %s" % (k, v) for k, v in errors_dict.items()])
+            raise InvalidDocumentError("""
+Invalid data to create a `%s` instance.\n%s""".strip() % (cls._class_name, errors))
+
         obj = cls(**data)
+
         obj._changed_fields = changed_fields
         obj._created = False
         return obj
@@ -1044,13 +1045,16 @@ class BaseDocument(object):
             for path in set_fields:
                 parts = path.split('.')
                 d = doc
+                new_path = []
                 for p in parts:
-                    if hasattr(d, '__getattr__'):
-                        d = getattr(p, d)
+                    if isinstance(d, DBRef):
+                        break
                     elif p.isdigit():
                         d = d[int(p)]
-                    else:
+                    elif hasattr(d, 'get'):
                         d = d.get(p)
+                    new_path.append(p)
+                path = '.'.join(new_path)
                 set_data[path] = d
         else:
             set_data = doc
@@ -1212,15 +1216,15 @@ class BaseList(list):
     def __init__(self, list_items, instance, name):
         self._instance = instance
         self._name = name
-        super(BaseList, self).__init__(list_items)
+        return super(BaseList, self).__init__(list_items)
 
     def __setitem__(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseList, self).__setitem__(*args, **kwargs)
+        return super(BaseList, self).__setitem__(*args, **kwargs)
 
     def __delitem__(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseList, self).__delitem__(*args, **kwargs)
+        return super(BaseList, self).__delitem__(*args, **kwargs)
 
     def __getstate__(self):
         self.observer = None
@@ -1274,23 +1278,23 @@ class BaseDict(dict):
     def __init__(self, dict_items, instance, name):
         self._instance = instance
         self._name = name
-        super(BaseDict, self).__init__(dict_items)
+        return super(BaseDict, self).__init__(dict_items)
 
     def __setitem__(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).__setitem__(*args, **kwargs)
+        return super(BaseDict, self).__setitem__(*args, **kwargs)
 
     def __delete__(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).__delete__(*args, **kwargs)
+        return super(BaseDict, self).__delete__(*args, **kwargs)
 
     def __delitem__(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).__delitem__(*args, **kwargs)
+        return super(BaseDict, self).__delitem__(*args, **kwargs)
 
     def __delattr__(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).__delattr__(*args, **kwargs)
+        return super(BaseDict, self).__delattr__(*args, **kwargs)
 
     def __getstate__(self):
         self.instance = None
@@ -1303,19 +1307,19 @@ class BaseDict(dict):
 
     def clear(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).clear(*args, **kwargs)
+        return super(BaseDict, self).clear(*args, **kwargs)
 
     def pop(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).pop(*args, **kwargs)
+        return super(BaseDict, self).pop(*args, **kwargs)
 
     def popitem(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).popitem(*args, **kwargs)
+        return super(BaseDict, self).popitem(*args, **kwargs)
 
     def update(self, *args, **kwargs):
         self._mark_as_changed()
-        super(BaseDict, self).update(*args, **kwargs)
+        return super(BaseDict, self).update(*args, **kwargs)
 
     def _mark_as_changed(self):
         if hasattr(self._instance, '_mark_as_changed'):

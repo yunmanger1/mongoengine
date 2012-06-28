@@ -30,7 +30,7 @@ except ImportError:
 __all__ = ['StringField', 'IntField', 'FloatField', 'BooleanField',
            'DateTimeField', 'EmbeddedDocumentField', 'ListField', 'DictField',
            'ObjectIdField', 'ReferenceField', 'ValidationError', 'MapField',
-           'DecimalField', 'ComplexDateTimeField', 'URLField',
+           'DecimalField', 'ComplexDateTimeField', 'URLField', 'DynamicField',
            'GenericReferenceField', 'FileField', 'BinaryField',
            'SortedListField', 'EmailField', 'GeoPointField', 'ImageField',
            'SequenceField', 'UUIDField', 'GenericEmbeddedDocumentField']
@@ -49,10 +49,13 @@ class StringField(BaseField):
         super(StringField, self).__init__(**kwargs)
 
     def to_python(self, value):
-        return unicode(value)
+        if isinstance(value, unicode):
+            return value
+        else:
+            return value.decode('utf-8')
 
     def validate(self, value):
-        if not isinstance(value, (str, unicode)):
+        if not isinstance(value, basestring):
             self.error('StringField only accepts string values')
 
         if self.max_length is not None and len(value) > self.max_length:
@@ -182,7 +185,7 @@ class FloatField(BaseField):
         if isinstance(value, int):
             value = float(value)
         if not isinstance(value, float):
-            self.error('FoatField only accepts float values')
+            self.error('FloatField only accepts float values')
 
         if self.min_value is not None and value < self.min_value:
             self.error('Float value is too small')
@@ -369,7 +372,7 @@ class ComplexDateTimeField(StringField):
         return self._convert_from_string(data)
 
     def __set__(self, instance, value):
-        value = self._convert_from_datetime(value)
+        value = self._convert_from_datetime(value) if value else value
         return super(ComplexDateTimeField, self).__set__(instance, value)
 
     def validate(self, value):
@@ -441,6 +444,9 @@ class GenericEmbeddedDocumentField(BaseField):
     :class:`~mongoengine.EmbeddedDocument` to be stored.
 
     Only valid values are subclasses of :class:`~mongoengine.EmbeddedDocument`.
+
+    ..note :: You can use the choices param to limit the acceptable
+    EmbeddedDocument types
     """
 
     def prepare_query_value(self, op, value):
@@ -468,6 +474,47 @@ class GenericEmbeddedDocumentField(BaseField):
         if not '_cls' in data:
             data['_cls'] = document._class_name
         return data
+
+
+class DynamicField(BaseField):
+    """Used by :class:`~mongoengine.DynamicDocument` to handle dynamic data"""
+
+    def to_mongo(self, value):
+        """Convert a Python type to a MongoDBcompatible type.
+        """
+
+        if isinstance(value, basestring):
+            return value
+
+        if hasattr(value, 'to_mongo'):
+            return value.to_mongo()
+
+        if not isinstance(value, (dict, list, tuple)):
+            return value
+
+        is_list = False
+        if not hasattr(value, 'items'):
+            is_list = True
+            value = dict([(k, v) for k, v in enumerate(value)])
+
+        data = {}
+        for k, v in value.items():
+            data[k] = self.to_mongo(v)
+
+        if is_list:  # Convert back to a list
+            value = [v for k, v in sorted(data.items(), key=itemgetter(0))]
+        else:
+            value = data
+        return value
+
+    def lookup_member(self, member_name):
+        return member_name
+
+    def prepare_query_value(self, op, value):
+        if isinstance(value, basestring):
+            from mongoengine.fields import StringField
+            return StringField().prepare_query_value(op, value)
+        return self.to_mongo(value)
 
 
 class ListField(ComplexBaseField):
@@ -612,6 +659,18 @@ class ReferenceField(BaseField):
       * NULLIFY     - Updates the reference to null.
       * CASCADE     - Deletes the documents associated with the reference.
       * DENY        - Prevent the deletion of the reference object.
+      * PULL        - Pull the reference from a :class:`~mongoengine.ListField` of references
+
+    Alternative syntax for registering delete rules (useful when implementing
+    bi-directional delete rules)
+
+    .. code-block:: python
+
+        class Bar(Document):
+            content = StringField()
+            foo = ReferenceField('Foo')
+
+        Bar.register_delete_rule(Foo, 'bar', NULLIFY)
 
     .. versionchanged:: 0.5 added `reverse_delete_rule`
     """
@@ -657,6 +716,9 @@ class ReferenceField(BaseField):
         return super(ReferenceField, self).__get__(instance, owner)
 
     def to_mongo(self, document):
+        if isinstance(document, DBRef):
+            return document
+
         id_field_name = self.document_type._meta['id_field']
         id_field = self.document_type._fields[id_field_name]
 
@@ -698,6 +760,8 @@ class GenericReferenceField(BaseField):
     ..note ::  Any documents used as a generic reference must be registered in the
     document registry.  Importing the model will automatically register it.
 
+    ..note :: You can use the choices param to limit the acceptable Document types
+
     .. versionadded:: 0.3
     """
 
@@ -731,6 +795,9 @@ class GenericReferenceField(BaseField):
     def to_mongo(self, document):
         if document is None:
             return None
+
+        if isinstance(document, (dict, SON)):
+            return document
 
         id_field_name = document.__class__._meta['id_field']
         id_field = document.__class__._fields[id_field_name]
@@ -826,6 +893,13 @@ class GridFSProxy(object):
         self_dict['_fs'] = None
         return self_dict
 
+    def __repr__(self):
+        return '<%s: %s>' % (self.__class__.__name__, self.grid_id)
+
+    def __cmp__(self, other):
+        return cmp((self.grid_id, self.collection_name, self.db_alias),
+                   (other.grid_id, other.collection_name, other.db_alias))
+
     @property
     def fs(self):
         if not self._fs:
@@ -872,10 +946,14 @@ class GridFSProxy(object):
         self.newfile.writelines(lines)
 
     def read(self, size=-1):
-        try:
-            return self.get().read(size)
-        except:
+        gridout = self.get()
+        if gridout is None:
             return None
+        else:
+            try:
+                return gridout.read(size)
+            except:
+                return ""
 
     def delete(self):
         # Delete file from GridFS, FileField still remains
@@ -920,19 +998,20 @@ class FileField(BaseField):
 
         # Check if a file already exists for this model
         grid_file = instance._data.get(self.name)
-        self.grid_file = grid_file
-        if isinstance(self.grid_file, self.proxy_class):
-            if not self.grid_file.key:
-                self.grid_file.key = self.name
-                self.grid_file.instance = instance
-            return self.grid_file
-        return self.proxy_class(key=self.name, instance=instance,
-                                db_alias=self.db_alias,
-                                collection_name=self.collection_name)
+        if not isinstance(grid_file, self.proxy_class):
+            grid_file = self.proxy_class(key=self.name, instance=instance,
+                                         db_alias=self.db_alias,
+                                         collection_name=self.collection_name)
+            instance._data[self.name] = grid_file
+
+        if not grid_file.key:
+            grid_file.key = self.name
+            grid_file.instance = instance
+        return grid_file
 
     def __set__(self, instance, value):
         key = self.name
-        if isinstance(value, file) or isinstance(value, str):
+        if (hasattr(value, 'read') and not isinstance(value, GridFSProxy)) or isinstance(value, str):
             # using "FileField() = file/string" notation
             grid_file = instance._data.get(self.name)
             # If a file already exists, delete it

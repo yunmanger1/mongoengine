@@ -2,6 +2,9 @@ import datetime
 import os
 import unittest
 import uuid
+import StringIO
+import tempfile
+import gridfs
 
 from decimal import Decimal
 
@@ -17,6 +20,10 @@ class FieldTest(unittest.TestCase):
     def setUp(self):
         connect(db='mongoenginetest')
         self.db = get_db()
+
+    def tearDown(self):
+        self.db.drop_collection('fs.files')
+        self.db.drop_collection('fs.chunks')
 
     def test_default_values(self):
         """Ensure that default field values are used when creating a document.
@@ -75,7 +82,6 @@ class FieldTest(unittest.TestCase):
 
         # Retrive data from db and verify it.
         ret = HandleNoneFields.objects.all()[0]
-
         self.assertEqual(ret.str_fld, None)
         self.assertEqual(ret.int_fld, None)
         self.assertEqual(ret.flt_fld, None)
@@ -906,6 +912,48 @@ class FieldTest(unittest.TestCase):
 
         Extensible.drop_collection()
 
+    def test_embedded_mapfield_db_field(self):
+
+        class Embedded(EmbeddedDocument):
+            number = IntField(default=0, db_field='i')
+
+        class Test(Document):
+            my_map = MapField(field=EmbeddedDocumentField(Embedded), db_field='x')
+
+        Test.drop_collection()
+
+        test = Test()
+        test.my_map['DICTIONARY_KEY'] = Embedded(number=1)
+        test.save()
+
+        Test.objects.update_one(inc__my_map__DICTIONARY_KEY__number=1)
+
+        test = Test.objects.get()
+        self.assertEqual(test.my_map['DICTIONARY_KEY'].number, 2)
+        doc = self.db.test.find_one()
+        self.assertEqual(doc['x']['DICTIONARY_KEY']['i'], 2)
+
+    def test_embedded_db_field(self):
+
+        class Embedded(EmbeddedDocument):
+            number = IntField(default=0, db_field='i')
+
+        class Test(Document):
+            embedded = EmbeddedDocumentField(Embedded, db_field='x')
+
+        Test.drop_collection()
+
+        test = Test()
+        test.embedded = Embedded(number=1)
+        test.save()
+
+        Test.objects.update_one(inc__embedded__number=1)
+
+        test = Test.objects.get()
+        self.assertEqual(test.embedded.number, 2)
+        doc = self.db.test.find_one()
+        self.assertEqual(doc['x']['i'], 2)
+
     def test_embedded_document_validation(self):
         """Ensure that invalid embedded documents cannot be assigned to
         embedded document fields.
@@ -1300,6 +1348,74 @@ class FieldTest(unittest.TestCase):
         self.assertEquals(repr(Person.objects(city=None)),
                             "[<Person: Person object>]")
 
+
+    def test_generic_reference_choices(self):
+        """Ensure that a GenericReferenceField can handle choices
+        """
+        class Link(Document):
+            title = StringField()
+
+        class Post(Document):
+            title = StringField()
+
+        class Bookmark(Document):
+            bookmark_object = GenericReferenceField(choices=(Post,))
+
+        Link.drop_collection()
+        Post.drop_collection()
+        Bookmark.drop_collection()
+
+        link_1 = Link(title="Pitchfork")
+        link_1.save()
+
+        post_1 = Post(title="Behind the Scenes of the Pavement Reunion")
+        post_1.save()
+
+        bm = Bookmark(bookmark_object=link_1)
+        self.assertRaises(ValidationError, bm.validate)
+
+        bm = Bookmark(bookmark_object=post_1)
+        bm.save()
+
+        bm = Bookmark.objects.first()
+        self.assertEqual(bm.bookmark_object, post_1)
+
+    def test_generic_reference_list_choices(self):
+        """Ensure that a ListField properly dereferences generic references and
+        respects choices.
+        """
+        class Link(Document):
+            title = StringField()
+
+        class Post(Document):
+            title = StringField()
+
+        class User(Document):
+            bookmarks = ListField(GenericReferenceField(choices=(Post,)))
+
+        Link.drop_collection()
+        Post.drop_collection()
+        User.drop_collection()
+
+        link_1 = Link(title="Pitchfork")
+        link_1.save()
+
+        post_1 = Post(title="Behind the Scenes of the Pavement Reunion")
+        post_1.save()
+
+        user = User(bookmarks=[link_1])
+        self.assertRaises(ValidationError, user.validate)
+
+        user = User(bookmarks=[post_1])
+        user.save()
+
+        user = User.objects.first()
+        self.assertEqual(user.bookmarks, [post_1])
+
+        Link.drop_collection()
+        Post.drop_collection()
+        User.drop_collection()
+
     def test_binary_fields(self):
         """Ensure that binary fields can be stored and retrieved.
         """
@@ -1481,6 +1597,21 @@ class FieldTest(unittest.TestCase):
         self.assertEquals(result.file.read(), text)
         self.assertEquals(result.file.content_type, content_type)
         result.file.delete() # Remove file from GridFS
+        PutFile.objects.delete()
+
+        # Ensure file-like objects are stored
+        putfile = PutFile()
+        putstring = StringIO.StringIO()
+        putstring.write(text)
+        putstring.seek(0)
+        putfile.file.put(putstring, content_type=content_type)
+        putfile.save()
+        putfile.validate()
+        result = PutFile.objects.first()
+        self.assertTrue(putfile == result)
+        self.assertEquals(result.file.read(), text)
+        self.assertEquals(result.file.content_type, content_type)
+        result.file.delete()
 
         streamfile = StreamFile()
         streamfile.file.new_file(content_type=content_type)
@@ -1529,6 +1660,49 @@ class FieldTest(unittest.TestCase):
         class DemoFile(Document):
             file = FileField()
         DemoFile.objects.create()
+
+
+    def test_file_field_no_default(self):
+
+        class GridDocument(Document):
+            the_file = FileField()
+
+        GridDocument.drop_collection()
+
+        with tempfile.TemporaryFile() as f:
+            f.write("Hello World!")
+            f.flush()
+
+            # Test without default
+            doc_a = GridDocument()
+            doc_a.save()
+
+
+            doc_b = GridDocument.objects.with_id(doc_a.id)
+            doc_b.the_file.replace(f, filename='doc_b')
+            doc_b.save()
+            self.assertNotEquals(doc_b.the_file.grid_id, None)
+
+            # Test it matches
+            doc_c = GridDocument.objects.with_id(doc_b.id)
+            self.assertEquals(doc_b.the_file.grid_id, doc_c.the_file.grid_id)
+
+            # Test with default
+            doc_d = GridDocument(the_file='')
+            doc_d.save()
+
+            doc_e = GridDocument.objects.with_id(doc_d.id)
+            self.assertEquals(doc_d.the_file.grid_id, doc_e.the_file.grid_id)
+
+            doc_e.the_file.replace(f, filename='doc_e')
+            doc_e.save()
+
+            doc_f = GridDocument.objects.with_id(doc_e.id)
+            self.assertEquals(doc_e.the_file.grid_id, doc_f.the_file.grid_id)
+
+        db = GridDocument._get_db()
+        grid_fs = gridfs.GridFS(db)
+        self.assertEquals(['doc_b', 'doc_e'], grid_fs.list())
 
     def test_file_uniqueness(self):
         """Ensure that each instance of a FileField is unique
@@ -1828,6 +2002,8 @@ class FieldTest(unittest.TestCase):
             name = StringField()
             like = GenericEmbeddedDocumentField()
 
+        Person.drop_collection()
+
         person = Person(name='Test User')
         person.like = Car(name='Fiat')
         person.save()
@@ -1840,6 +2016,59 @@ class FieldTest(unittest.TestCase):
 
         person = Person.objects.first()
         self.assertTrue(isinstance(person.like, Dish))
+
+    def test_generic_embedded_document_choices(self):
+        """Ensure you can limit GenericEmbeddedDocument choices
+        """
+        class Car(EmbeddedDocument):
+            name = StringField()
+
+        class Dish(EmbeddedDocument):
+            food = StringField(required=True)
+            number = IntField()
+
+        class Person(Document):
+            name = StringField()
+            like = GenericEmbeddedDocumentField(choices=(Dish,))
+
+        Person.drop_collection()
+
+        person = Person(name='Test User')
+        person.like = Car(name='Fiat')
+        self.assertRaises(ValidationError, person.validate)
+
+        person.like = Dish(food="arroz", number=15)
+        person.save()
+
+        person = Person.objects.first()
+        self.assertTrue(isinstance(person.like, Dish))
+
+    def test_generic_list_embedded_document_choices(self):
+        """Ensure you can limit GenericEmbeddedDocument choices inside a list
+        field
+        """
+        class Car(EmbeddedDocument):
+            name = StringField()
+
+        class Dish(EmbeddedDocument):
+            food = StringField(required=True)
+            number = IntField()
+
+        class Person(Document):
+            name = StringField()
+            likes = ListField(GenericEmbeddedDocumentField(choices=(Dish,)))
+
+        Person.drop_collection()
+
+        person = Person(name='Test User')
+        person.likes = [Car(name='Fiat')]
+        self.assertRaises(ValidationError, person.validate)
+
+        person.likes = [Dish(food="arroz", number=15)]
+        person.save()
+
+        person = Person.objects.first()
+        self.assertTrue(isinstance(person.likes[0], Dish))
 
     def test_recursive_validation(self):
         """Ensure that a validation result to_dict is available.
@@ -1884,44 +2113,6 @@ class FieldTest(unittest.TestCase):
 
         post.comments[1].content = 'here we go'
         post.validate()
-
-
-class ValidatorErrorTest(unittest.TestCase):
-
-    def test_to_dict(self):
-        """Ensure a ValidationError handles error to_dict correctly.
-        """
-        error = ValidationError('root')
-        self.assertEquals(error.to_dict(), {})
-
-        # 1st level error schema
-        error.errors = {'1st': ValidationError('bad 1st'), }
-        self.assertTrue('1st' in error.to_dict())
-        self.assertEquals(error.to_dict()['1st'], 'bad 1st')
-
-        # 2nd level error schema
-        error.errors = {'1st': ValidationError('bad 1st', errors={
-            '2nd': ValidationError('bad 2nd'),
-        })}
-        self.assertTrue('1st' in error.to_dict())
-        self.assertTrue(isinstance(error.to_dict()['1st'], dict))
-        self.assertTrue('2nd' in error.to_dict()['1st'])
-        self.assertEquals(error.to_dict()['1st']['2nd'], 'bad 2nd')
-
-        # moar levels
-        error.errors = {'1st': ValidationError('bad 1st', errors={
-            '2nd': ValidationError('bad 2nd', errors={
-                '3rd': ValidationError('bad 3rd', errors={
-                    '4th': ValidationError('Inception'),
-                }),
-            }),
-        })}
-        self.assertTrue('1st' in error.to_dict())
-        self.assertTrue('2nd' in error.to_dict()['1st'])
-        self.assertTrue('3rd' in error.to_dict()['1st']['2nd'])
-        self.assertTrue('4th' in error.to_dict()['1st']['2nd']['3rd'])
-        self.assertEquals(error.to_dict()['1st']['2nd']['3rd']['4th'],
-                          'Inception')
 
 
 if __name__ == '__main__':
