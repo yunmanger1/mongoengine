@@ -2,6 +2,7 @@
 MongoEngine
 ===========
 :Info: MongoEngine is an ORM-like layer on top of PyMongo.
+:Repository: https://github.com/MongoEngine/mongoengine
 :Author: Harry Marr (http://github.com/hmarr)
 :Maintainer: Ross Lawley (http://github.com/rozza)
 
@@ -13,7 +14,7 @@ About
 MongoEngine is a Python Object-Document Mapper for working with MongoDB.
 Documentation available at http://mongoengine-odm.rtfd.org - there is currently
 a `tutorial <http://readthedocs.org/docs/mongoengine-odm/en/latest/tutorial.html>`_, a `user guide
-<http://readthedocs.org/docs/mongoengine-odm/en/latest/userguide.html>`_ and an `API reference
+<https://mongoengine-odm.readthedocs.org/en/latest/guide/index.html>`_ and an `API reference
 <http://readthedocs.org/docs/mongoengine-odm/en/latest/apireference.html>`_.
 
 Installation
@@ -62,11 +63,6 @@ Some simple examples of what MongoEngine code looks like::
     ...         print 'Link:', post.url
     ...     print
     ...
-    === Using MongoEngine ===
-    See the tutorial
-
-    === MongoEngine Docs ===
-    Link: hmarr.com/mongoengine
 
     >>> len(BlogPost.objects)
     2
@@ -84,7 +80,7 @@ Some simple examples of what MongoEngine code looks like::
 Tests
 =====
 To run the test suite, ensure you are running a local instance of MongoDB on
-the standard port, and run ``python setup.py test``.
+the standard port, and run: ``python setup.py test``.
 
 Community
 =========
@@ -92,11 +88,8 @@ Community
   <http://groups.google.com/group/mongoengine-users>`_
 - `MongoEngine Developers mailing list
   <http://groups.google.com/group/mongoengine-dev>`_
-- `#mongoengine IRC channel <irc://irc.freenode.net/mongoengine>`_
+- `#mongoengine IRC channel <http://webchat.freenode.net/?channels=mongoengine>`_
 
 Contributing
 ============
-The source is available on `GitHub <http://github.com/MongoEngine/mongoengine>`_ - to
-contribute to the project, fork it on GitHub and send a pull request, all
-contributions and suggestions are welcome!
-
+We welcome contributions! see  the`Contribution guidelines <https://github.com/MongoEngine/mongoengine/blob/master/CONTRIBUTING.rst>`_
